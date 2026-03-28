@@ -1,6 +1,7 @@
 ﻿# i春秋 CTF 榜单采集器
 
 一个基于**PySide6**的i春秋比赛观赛榜单采集工具，好用的话给个star吧🙏~ 🥺
+<img width="1080" height="551" alt="image" src="https://github.com/user-attachments/assets/50dbd877-c199-4233-9c8d-4c5eb397360b" />
 
 使用方法很简单：
 - 输入比赛链接并绑定比赛
