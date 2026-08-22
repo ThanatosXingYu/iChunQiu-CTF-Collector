@@ -1,0 +1,58 @@
+﻿# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ===== 虚拟环境 =====
+.venv/
+venv/
+env/
+ENV/
+.env
+
+# ===== IDE =====
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== 项目产物 =====
+# 默认输出目录（导出 Excel 用）
+outputs/
+
+# 调试时产生的请求日志
+*_request_debug_*.json
+
+# 本地测试脚本（带下划线前缀的临时脚本）
+_test_*.py
+_verify*.py
+_apply_*.py
+_probe*.py
+_e2e.py
+_gui_smoke.py
+
+# 敏感凭据（如果你打算本地自定义 API_SECRET）
+.env.local
+secrets.py

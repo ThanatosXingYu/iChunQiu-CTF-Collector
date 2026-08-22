@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from collector import IChunQiuCollector, LeaderboardExportResult, MatchBindingInfo
+from collector import ExportStatus, IChunQiuCollector, LeaderboardExportResult, MatchBindingInfo
 
 
 class BindWorker(QThread):
@@ -66,10 +66,10 @@ class ExportWorker(QThread):
         self.page_size = page_size
 
     def run(self) -> None:
-        try:
-            collector = IChunQiuCollector(log_callback=lambda m: self.log.emit(m))
-            results: list[LeaderboardExportResult] = []
-            for board_key in self.board_keys:
+        collector = IChunQiuCollector(log_callback=lambda m: self.log.emit(m))
+        results: list[LeaderboardExportResult] = []
+        for board_key in self.board_keys:
+            try:
                 result = collector.export_board_xlsx(
                     bind=self.bind_info,
                     output_root=self.output_dir,
@@ -77,10 +77,28 @@ class ExportWorker(QThread):
                     page_size=self.page_size,
                     debug_mode=False,
                 )
-                results.append(result)
-            self.success.emit(results)
-        except Exception as exc:  # noqa: BLE001
-            self.error.emit(f"{exc}\n\n{traceback.format_exc()}")
+            except Exception as exc:  # noqa: BLE001
+                # 单个榜单的彻底崩溃（极少见，比如连 Excel 都打不开）→ 包成 FAILED 结果继续
+                detail = f"{type(exc).__name__}: {exc}\n\n{traceback.format_exc()}"
+                self.log.emit(f"[Worker] {board_key} 未捕获异常: {detail}")
+                results.append(
+                    LeaderboardExportResult(
+                        board_key=board_key,
+                        board_name=IChunQiuCollector.BOARD_CONFIGS.get(board_key, {}).get("name", board_key),
+                        status=ExportStatus.FAILED,
+                        excel_path="",
+                        total_rows=0,
+                        total_pages=0,
+                        endpoint=IChunQiuCollector.BOARD_CONFIGS.get(board_key, {}).get("endpoint", ""),
+                        error_message=detail,
+                    )
+                )
+                continue
+            results.append(result)
+            self.log.emit(
+                f"[Worker] {board_key} -> {result.status} ({result.total_rows} 条)"
+            )
+        self.success.emit(results)
 
 
 class MainWindow(QMainWindow):
@@ -90,6 +108,7 @@ class MainWindow(QMainWindow):
         ("question", "导出题目榜单"),
         ("single", "导出单人总榜"),
         ("category", "导出题型榜单"),
+        ("team_info", "导出团队信息"),
     ]
 
     def __init__(self) -> None:
@@ -441,30 +460,110 @@ class MainWindow(QMainWindow):
             return
         results: list[LeaderboardExportResult] = result_obj
 
+        # 分桶
+        success_list = [r for r in results if r.status == ExportStatus.SUCCESS]
+        no_data_list = [r for r in results if r.status == ExportStatus.NO_DATA]
+        failed_list = [r for r in results if r.status == ExportStatus.FAILED]
+
         for result in results:
-            self.append_log(f"导出完成: {result.excel_path}")
-            self.append_log(f"榜单类型: {result.board_name} ({result.board_key})")
-            self.append_log(f"排行榜接口: {result.endpoint}")
-            self.append_log(f"总条数: {result.total_rows}, 总页数: {result.total_pages}")
+            self.append_log(f"[{result.status}] {result.board_name} ({result.board_key})")
+            self.append_log(f"  接口        : {result.endpoint}")
+            self.append_log(f"  总条数      : {result.total_rows}, 总页数: {result.total_pages}")
+            if result.excel_path:
+                self.append_log(f"  Excel       : {result.excel_path}")
+            if result.error_message:
+                self.append_log(f"  说明/错误   : {result.error_message}")
 
         self.set_busy(False, "导出完成")
+
+        # 单个导出仍走原路径
         if len(results) == 1:
-            result = results[0]
-            QMessageBox.information(self, "完成", f"{result.board_name}导出成功。\n\n{result.excel_path}")
+            r = results[0]
+            if r.status == ExportStatus.SUCCESS:
+                QMessageBox.information(self, "完成", f"{r.board_name}导出成功。\n\n{r.excel_path}")
+            elif r.status == ExportStatus.NO_DATA:
+                QMessageBox.information(
+                    self, "完成", f"{r.board_name}暂无数据，已生成提示文件。\n\n{r.excel_path or '(无)'}"
+                )
+            else:
+                self._show_error_box(f"{r.board_name}导出失败", r.error_message or "未知错误")
             return
 
-        paths = "\n".join(item.excel_path for item in results)
-        QMessageBox.information(
-            self,
-            "完成",
-            f"一键采集完成，共导出 {len(results)} 个榜单文件：\n\n{paths}",
-        )
+        # 多个榜单：弹汇总
+        self._show_summary(results, success_list, no_data_list, failed_list)
 
     def on_worker_error(self, detail: str) -> None:
         self.append_log("任务失败：")
         self.append_log(detail)
         self.set_busy(False, "失败")
-        QMessageBox.critical(self, "错误", detail)
+        self._show_error_box("任务执行失败", detail)
+
+    def _show_error_box(self, title: str, detail: str) -> None:
+        """统一的错误弹窗：主文本简短，详细区放完整 traceback，避免被 QMessageBox 截断。"""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Critical)
+        box.setWindowTitle(title)
+        box.setText(title)
+        # 截断主文本以避免撑爆窗口
+        short = detail.split("\n", 1)[0][:300]
+        box.setInformativeText(short)
+        box.setDetailedText(detail)
+        box.setStandardButtons(QMessageBox.Ok)
+        box.exec()
+
+    def _show_summary(
+        self,
+        all_results: list[LeaderboardExportResult],
+        success_list: list[LeaderboardExportResult],
+        no_data_list: list[LeaderboardExportResult],
+        failed_list: list[LeaderboardExportResult],
+    ) -> None:
+        """一键采集后的汇总弹窗。"""
+        s_count = len(success_list)
+        n_count = len(no_data_list)
+        f_count = len(failed_list)
+        total = len(all_results)
+
+        # 拼主文本
+        lines = [f"共处理 {total} 个榜单："]
+        lines.append(f"  ✅ 成功 {s_count} 个")
+        lines.append(f"  ⚠️  无数据 {n_count} 个")
+        lines.append(f"  ❌ 失败 {f_count} 个")
+
+        if success_list:
+            lines.append("")
+            lines.append("成功导出的文件：")
+            for r in success_list:
+                lines.append(f"  • {r.board_name} ({r.total_rows} 行)")
+                if r.excel_path:
+                    lines.append(f"      {r.excel_path}")
+
+        if no_data_list:
+            lines.append("")
+            lines.append("无数据的榜单：")
+            for r in no_data_list:
+                lines.append(f"  • {r.board_name} — {r.error_message or '暂无数据'}")
+                if r.excel_path:
+                    lines.append(f"      提示文件: {r.excel_path}")
+
+        # 失败列表拼到详细区
+        detail_lines: list[str] = []
+        if failed_list:
+            detail_lines.append("失败明细：")
+            for r in failed_list:
+                detail_lines.append("")
+                detail_lines.append(f"--- {r.board_name} ({r.board_key}) ---")
+                detail_lines.append(f"endpoint: {r.endpoint}")
+                detail_lines.append(r.error_message or "未知错误")
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Information if f_count == 0 else QMessageBox.Warning)
+        box.setWindowTitle("一键采集完成")
+        box.setText("\n".join(lines))
+        if detail_lines:
+            box.setDetailedText("\n".join(detail_lines))
+        box.setStandardButtons(QMessageBox.Ok)
+        box.exec()
 
     def open_output_dir(self) -> None:
         target = self.output_edit.text().strip() or self.last_export_dir

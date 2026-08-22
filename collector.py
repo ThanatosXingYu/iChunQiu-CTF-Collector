@@ -42,20 +42,51 @@ class MatchBindingInfo:
     industry_label: str
 
 
+class ExportStatus:
+    """导出状态枚举。"""
+
+    SUCCESS = "success"      # 正常导出，有数据
+    NO_DATA = "no_data"      # 接口返回"暂无数据"等业务级空结果
+    FAILED = "failed"        # 调用过程中发生未捕获异常
+
+
+class NoDataError(Exception):
+    """业务级"无数据"异常：例如接口 code=116 message 含"暂无数据"。
+
+    与真正错误的区别：这是平台告知"该榜单就是没有数据"，应跳过/写提示 Sheet，
+    而不是以 RuntimeError 形式让调用方失败。
+    """
+
+    def __init__(self, board_name: str, message: str = "") -> None:
+        self.board_name = board_name
+        self.message = message or "暂无数据"
+        super().__init__(f"{board_name}：{self.message}")
+
+
 @dataclass
 class LeaderboardExportResult:
     board_key: str
     board_name: str
-    excel_path: str
+    status: str  # ExportStatus 中的一个
+    excel_path: str  # NO_DATA / FAILED 时可能为空字符串
     total_rows: int
     total_pages: int
     endpoint: str
-    debug_json_path: str
+    error_message: str = ""  # 仅 FAILED / NO_DATA 时填充
+    debug_json_path: str = ""
 
 
 class IChunQiuCollector:
     BASE_API = os.getenv("ICHUNQIU_BASE_API", "https://apiterminator.ichunqiu.com").rstrip("/")
     API_SECRET = os.getenv("ICHUNQIU_API_SECRET", "7637b08bdb0b29e08300a976b24ca672")
+
+    # 浏览器 User-Agent 与来源信息，避免被 CDN/WAF 识别为脚本请求而拦截。
+    USER_AGENT = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/126.0.0.0 Safari/537.36"
+    )
+    ORIGIN = "https://match.ichunqiu.com"
 
     BOARD_CONFIGS: Dict[str, Dict[str, str]] = {
         "solved": {"name": "解题总榜", "endpoint": "/match/rank/solved", "sheet": "解题总榜表"},
@@ -63,6 +94,7 @@ class IChunQiuCollector:
         "question": {"name": "题目榜单", "endpoint": "/match/rank/question", "sheet": "题目榜单表"},
         "single": {"name": "单人总榜", "endpoint": "/match/rank/person", "sheet": "单人总榜表"},
         "category": {"name": "题型榜单", "endpoint": "/match/rank/category", "sheet": "题型榜单表"},
+        "team_info": {"name": "团队信息", "endpoint": "/match/team/users", "sheet": "团队成员"},
     }
 
     OFFICIAL_CONTENT: Dict[str, str] = {
@@ -84,7 +116,35 @@ class IChunQiuCollector:
         "dwqx": "队伍强项",
         "province": "省份",
         "ssfq": "所属分区",
+        "user_id": "用户ID",
+        "user_name": "成员名称",
+        "user_type": "成员角色",
+        "team_id": "队伍ID",
+        "team_name": "队伍名称",
+        "team_rank": "排名",
+        "is_reply": "是否参赛",
+        "is_login": "是否签到",
+        "is_upload_answer": "是否上传答案",
+        "face_status": "人脸核验",
+        "face_on_time": "人脸签到时间",
+        "face_off_time": "人脸签退时间",
+        "call_time": "呼叫时间",
+        "micro_time": "在线时长(秒)",
+        "create_time": "加入时间",
+        "update_time": "更新时间",
     }
+
+    @staticmethod
+    def _role_label(user_type: Any) -> str:
+        try:
+            v = int(user_type)
+        except (TypeError, ValueError):
+            return str(user_type)
+        if v == 1:
+            return "队员"
+        if v == 2:
+            return "队长"
+        return str(v)
 
     def __init__(self, log_callback: Optional[Callable[[str], None]] = None, lang: str = "zh-cn") -> None:
         self._log_callback = log_callback
@@ -190,6 +250,11 @@ class IChunQiuCollector:
             "SIGN": self._calc_sign(payload),
             "X-Lang": self._lang,
             "Content-Type": "application/json;charset=UTF-8",
+            "User-Agent": self.USER_AGENT,
+            "Referer": f"{self.ORIGIN}/",
+            "Origin": self.ORIGIN,
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9",
         }
 
         url = f"{self.BASE_API}{endpoint}"
@@ -365,8 +430,12 @@ class IChunQiuCollector:
         payload = self._payload_for_board(board_key, page_index=1, page_size=page_size, category_id=category_id)
         first_resp = self._post(endpoint, payload, k=bind.k, token=bind.token)
         if first_resp.get("code") != 0:
-            message = first_resp.get("message", "未知错误")
-            raise RuntimeError(f"{self.BOARD_CONFIGS[board_key]['name']}接口调用失败: code={first_resp.get('code')} {message}")
+            message = str(first_resp.get("message", "未知错误"))
+            board_name = self.BOARD_CONFIGS[board_key]["name"]
+            # 业务级无数据（最常见的 code=116 "暂无数据"）→ 抛 NoDataError 让上层优雅处理
+            if first_resp.get("code") == 116 or "暂无" in message or "没有" in message:
+                raise NoDataError(board_name, message)
+            raise RuntimeError(f"{board_name}接口调用失败: code={first_resp.get('code')} {message}")
 
         first_data = self._as_dict(first_resp.get("data"))
         first_rows = self._as_list(first_data.get("lists"))
@@ -555,6 +624,94 @@ class IChunQiuCollector:
                 width = min(max(8, max_len + 2), 90)
             ws.column_dimensions[letter].width = width
 
+    def _fetch_team_roster(self, bind: MatchBindingInfo) -> List[Dict[str, Any]]:
+        """拉取所有团队成员信息。先从积分榜获取全部 team_id，再逐队调用 /match/team/users。"""
+        # 1) 拉所有 team_id（优先使用积分榜数据；若失败回退到解题榜）
+        team_rows: List[Dict[str, Any]] = []
+        for source_key in ("integral", "solved"):
+            try:
+                _, team_rows, _ = self._collect_rows_for_board(
+                    bind=bind, board_key=source_key, page_size=200
+                )
+                if team_rows:
+                    break
+            except NoDataError:
+                continue
+            except Exception as exc:  # noqa: BLE001
+                self._log(f"[{self._now()}] 获取团队列表({source_key})失败: {exc}")
+                continue
+
+        if not team_rows:
+            raise NoDataError(self.BOARD_CONFIGS["team_info"]["name"], "未拉取到任何团队")
+
+        self._log(f"[{self._now()}] 共 {len(team_rows)} 支队伍，开始逐队拉取成员")
+
+        # 2) 逐队拉成员
+        all_members: List[Dict[str, Any]] = []
+        failed_teams: List[Tuple[str, str]] = []
+        for team in team_rows:
+            team_id = str(team.get("team_id") or team.get("source_id") or "").strip()
+            if not team_id:
+                continue
+            payload = {"team_id": team_id, "page_index": 1, "page_size": 200}
+            try:
+                resp = self._post("/match/team/users", payload, k=bind.k, token=bind.token)
+            except Exception as exc:  # noqa: BLE001
+                failed_teams.append((team.get("team_name", team_id), str(exc)))
+                continue
+            if resp.get("code") != 0:
+                msg = resp.get("message", "")
+                if resp.get("code") == 116 or "暂无" in str(msg):
+                    # 该队没有成员数据（单人/空队）—— 跳过即可
+                    self._log(f"[{self._now()}] 队伍 {team.get('team_name', team_id)} 无成员数据")
+                    continue
+                failed_teams.append((team.get("team_name", team_id), f"code={resp.get('code')} {msg}"))
+                continue
+            data_node = self._as_dict(resp.get("data"))
+            members = self._as_list(data_node.get("lists"))
+            if not members:
+                continue
+            for m in members:
+                if not isinstance(m, dict):
+                    continue
+                # 注入队伍维度信息：紧跟在 team_id 之后，便于阅读时按"队伍"聚类查看
+                if "team_id" not in m or not m["team_id"]:
+                    m["team_id"] = team_id
+                team_dim = {
+                    "team_name": team.get("team_name", ""),
+                    "team_rank": team.get("team_rank", ""),
+                    "school": team.get("school", ""),
+                }
+                ordered: Dict[str, Any] = {}
+                inserted = False
+                for k, v in m.items():
+                    ordered[k] = v
+                    if k == "team_id":
+                        ordered.update(team_dim)
+                        inserted = True
+                if not inserted:
+                    ordered.update(team_dim)
+                all_members.append(ordered)
+
+        if failed_teams:
+            sample = ", ".join(f"{name}({err})" for name, err in failed_teams[:3])
+            self._log(f"[{self._now()}] 部分队伍成员获取失败: {sample}")
+
+        if not all_members:
+            raise NoDataError(self.BOARD_CONFIGS["team_info"]["name"], "所有队伍均无成员数据")
+        return all_members
+
+    def _flatten_member_row(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        """成员行扁平化：剔除嵌套结构，把 user_type 转中文。"""
+        output: Dict[str, Any] = {}
+        for key, value in item.items():
+            if isinstance(value, (list, dict)):
+                continue
+            output[key] = value
+        if "user_type" in output:
+            output["user_type"] = self._role_label(output["user_type"])
+        return output
+
     def _build_dataframe(self, rows: List[Dict[str, Any]], bind: MatchBindingInfo, board_key: str) -> pd.DataFrame:
         flattened = [self._flatten_row(item, board_key=board_key) for item in rows]
         df = pd.DataFrame(flattened)
@@ -588,90 +745,168 @@ class IChunQiuCollector:
         file_name = f"{self._safe_name(bind.event_key)}_{board_name}_{stamp}.xlsx"
         excel_path = out_root / file_name
 
+        status = ExportStatus.SUCCESS
+        error_message = ""
         total_rows = 0
         total_pages = 0
         endpoint = self.BOARD_CONFIGS[board_key]["endpoint"]
         used_sheet_names: set[str] = set()
+        sheets_written = 0
+        writer: Optional[pd.ExcelWriter] = None
+        final_excel_path = ""
 
-        with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
-            if board_key != "category":
-                endpoint, rows, total_pages = self._collect_rows_for_board(
-                    bind=bind,
-                    board_key=board_key,
-                    page_size=page_size,
-                )
-                total_rows = len(rows)
-                df = self._build_dataframe(rows, bind=bind, board_key=board_key)
-                sheet_name = self.BOARD_CONFIGS[board_key]["sheet"]
-                sheet_name = self._safe_sheet_name(sheet_name, used_sheet_names)
-                df.to_excel(writer, sheet_name=sheet_name, index=False)
-                self._format_rank_sheet(writer.book[sheet_name])
-            else:
-                categories = self._fetch_category_list(bind)
-                if not categories:
-                    self._log(f"[{self._now()}] 题型榜单未返回分类，导出空表。")
-                    empty_df = pd.DataFrame()
+        try:
+            writer = pd.ExcelWriter(excel_path, engine="openpyxl")
+            try:
+                if board_key == "team_info":
+                    members = self._fetch_team_roster(bind)
+                    total_rows = len(members)
+                    flattened = [self._flatten_member_row(m) for m in members]
+                    df = pd.DataFrame(flattened)
+                    if not df.empty:
+                        if "team_rank" in df.columns:
+                            df["team_rank"] = pd.to_numeric(df["team_rank"], errors="coerce")
+                        sort_cols = [c for c in ["team_rank", "team_name", "user_name"] if c in df.columns]
+                        if sort_cols:
+                            df = df.sort_values(by=sort_cols, na_position="last")
+                        df = self._translate_dataframe_headers(df, bind=bind, board_key=board_key)
                     sheet_name = self._safe_sheet_name(self.BOARD_CONFIGS[board_key]["sheet"], used_sheet_names)
-                    empty_df.to_excel(writer, sheet_name=sheet_name, index=False)
+                    df.to_excel(writer, sheet_name=sheet_name, index=False)
                     self._format_rank_sheet(writer.book[sheet_name])
-                else:
-                    self._log(
-                        f"[{self._now()}] 发现题型分类: {', '.join(str(c['title']) for c in categories)}"
+                    sheets_written += 1
+                elif board_key != "category":
+                    endpoint, rows, total_pages = self._collect_rows_for_board(
+                        bind=bind,
+                        board_key=board_key,
+                        page_size=page_size,
                     )
-                    for category in categories:
-                        category_id = str(category["id"])
-                        category_title = str(category["title"])
-                        _, rows, pages = self._collect_rows_for_board(
-                            bind=bind,
-                            board_key=board_key,
-                            page_size=page_size,
-                            category_id=category_id,
-                        )
-                        total_rows += len(rows)
-                        total_pages += pages
+                    total_rows = len(rows)
+                    if total_rows == 0:
+                        status = ExportStatus.NO_DATA
+                        error_message = "该榜单暂无数据"
+                        self._log(f"[{self._now()}] {board_name}无数据，跳过 Excel 生成")
+                    else:
                         df = self._build_dataframe(rows, bind=bind, board_key=board_key)
-                        sheet_name = self._safe_sheet_name(category_title, used_sheet_names)
+                        sheet_name = self._safe_sheet_name(self.BOARD_CONFIGS[board_key]["sheet"], used_sheet_names)
                         df.to_excel(writer, sheet_name=sheet_name, index=False)
                         self._format_rank_sheet(writer.book[sheet_name])
+                        sheets_written += 1
+                else:
+                    categories = self._fetch_category_list(bind)
+                    if not categories:
+                        status = ExportStatus.NO_DATA
+                        error_message = "题型榜单未返回分类"
+                        self._log(f"[{self._now()}] 题型榜单无分类，跳过 Excel 生成")
+                    else:
                         self._log(
-                            f"[{self._now()}] 题型 {category_title} 导出完成: {len(rows)} 条, {pages} 页"
+                            f"[{self._now()}] 发现题型分类: {', '.join(str(c['title']) for c in categories)}"
                         )
+                        for category in categories:
+                            category_id = str(category["id"])
+                            category_title = str(category["title"])
+                            _, rows, pages = self._collect_rows_for_board(
+                                bind=bind,
+                                board_key=board_key,
+                                page_size=page_size,
+                                category_id=category_id,
+                            )
+                            total_rows += len(rows)
+                            total_pages += pages
+                            if rows:
+                                df = self._build_dataframe(rows, bind=bind, board_key=board_key)
+                                sheet_name = self._safe_sheet_name(category_title, used_sheet_names)
+                                df.to_excel(writer, sheet_name=sheet_name, index=False)
+                                self._format_rank_sheet(writer.book[sheet_name])
+                                sheets_written += 1
+                                self._log(
+                                    f"[{self._now()}] 题型 {category_title} 导出完成: {len(rows)} 条, {pages} 页"
+                                )
+                        if sheets_written == 0:
+                            status = ExportStatus.NO_DATA
+                            error_message = "所有题型分类下均无数据"
+                            self._log(f"[{self._now()}] 题型榜单各分类均无数据，跳过 Excel 生成")
+                # 走到这里说明没抛异常，writer 已有内容可保存
+                writer.close()
+                writer = None
+                final_excel_path = str(excel_path)
+            except NoDataError as nd:
+                status = ExportStatus.NO_DATA
+                error_message = str(nd)
+                self._log(f"[{self._now()}] {board_name}无数据: {error_message}")
+                # NO_DATA 不再生成任何 Sheet / 文件
+                try:
+                    if writer is not None:
+                        writer.close()
+                except Exception:
+                    pass
+                writer = None
+        except Exception as exc:  # noqa: BLE001
+            status = ExportStatus.FAILED
+            error_message = f"{type(exc).__name__}: {exc}"
+            self._log(f"[{self._now()}] {board_name}失败: {error_message}")
+        finally:
+            if writer is not None:
+                try:
+                    writer.close()
+                except Exception:
+                    pass
+            # 写出过 Sheet（SUCCESS）但路径未记录 → 补上；NO_DATA / FAILED 不补
+            if status == ExportStatus.SUCCESS and sheets_written > 0 and not final_excel_path:
+                final_excel_path = str(excel_path)
+            # NO_DATA / FAILED：若磁盘上残留了空 xlsx（pd.ExcelWriter 已创建），清理掉
+            if status != ExportStatus.SUCCESS and excel_path.exists():
+                try:
+                    excel_path.unlink()
+                except Exception:
+                    pass
 
         debug_json_path = ""
         if debug_mode:
             debug_path = out_root / f"{self._safe_name(bind.event_key)}_{board_name}_request_debug_{stamp}.json"
-            debug_path.write_text(
-                json.dumps(
-                    {
-                        "bind": {
-                            "title": bind.title,
-                            "event_key": bind.event_key,
-                            "k": bind.k,
-                            "token": bind.token,
-                            "entry_type": bind.entry_type,
-                            "mode_type": bind.mode_type,
-                            "score_type": bind.score_type,
+            try:
+                debug_path.write_text(
+                    json.dumps(
+                        {
+                            "bind": {
+                                "title": bind.title,
+                                "event_key": bind.event_key,
+                                "k": bind.k,
+                                "token": bind.token,
+                                "entry_type": bind.entry_type,
+                                "mode_type": bind.mode_type,
+                                "score_type": bind.score_type,
+                            },
+                            "board_key": board_key,
+                            "board_name": board_name,
+                            "status": status,
+                            "requests": self._request_logs,
                         },
-                        "board_key": board_key,
-                        "board_name": board_name,
-                        "requests": self._request_logs,
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
-            debug_json_path = str(debug_path)
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+                debug_json_path = str(debug_path)
+            except Exception as exc:  # noqa: BLE001
+                self._log(f"[{self._now()}] 写入 debug json 失败: {exc}")
 
-        self._log(f"[{self._now()}] 导出完成: {excel_path}")
-        self._log(f"[{self._now()}] 总条数: {total_rows}")
+        if status == ExportStatus.SUCCESS:
+            self._log(f"[{self._now()}] 导出完成: {final_excel_path}")
+            self._log(f"[{self._now()}] 总条数: {total_rows}")
+        elif status == ExportStatus.NO_DATA:
+            self._log(f"[{self._now()}] {board_name}无数据，未生成 Excel 文件")
+        else:
+            self._log(f"[{self._now()}] {board_name}失败，未生成 Excel 文件")
+
         return LeaderboardExportResult(
             board_key=board_key,
             board_name=board_name,
-            excel_path=str(excel_path),
+            status=status,
+            excel_path=final_excel_path,
             total_rows=total_rows,
             total_pages=total_pages if total_pages > 0 else 1,
             endpoint=endpoint,
+            error_message=error_message,
             debug_json_path=debug_json_path,
         )
 
