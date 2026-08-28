@@ -2,7 +2,7 @@
 
 基于 PySide6 的桌面端比赛数据采集工具。输入 i春秋比赛地址并完成绑定后，可以将公开观赛数据整理为格式化的 Excel 工作簿。
 
-![应用界面](https://github.com/user-attachments/assets/50dbd877-c199-4233-9c8d-4c5eb397360b)
+<img width="2560" height="1784" alt="10f02efe-b813-4269-8a84-d66294c8cfd6" src="https://github.com/user-attachments/assets/1705088f-7c1b-4e39-a562-0649a388b13d" />
 
 ## 功能
 
