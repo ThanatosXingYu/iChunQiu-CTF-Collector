@@ -18,6 +18,8 @@ import pandas as pd
 import requests
 from openpyxl.styles import Alignment, Border, Font, Side
 from openpyxl.worksheet.worksheet import Worksheet
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 @dataclass
@@ -46,6 +48,7 @@ class ExportStatus:
     """导出状态枚举。"""
 
     SUCCESS = "success"      # 正常导出，有数据
+    PARTIAL_SUCCESS = "partial_success"  # 已生成文件，但部分数据获取失败
     NO_DATA = "no_data"      # 接口返回"暂无数据"等业务级空结果
     FAILED = "failed"        # 调用过程中发生未捕获异常
 
@@ -63,6 +66,10 @@ class NoDataError(Exception):
         super().__init__(f"{board_name}：{self.message}")
 
 
+class OperationCancelled(Exception):
+    """用户主动取消当前任务。"""
+
+
 @dataclass
 class LeaderboardExportResult:
     board_key: str
@@ -72,7 +79,7 @@ class LeaderboardExportResult:
     total_rows: int
     total_pages: int
     endpoint: str
-    error_message: str = ""  # 仅 FAILED / NO_DATA 时填充
+    error_message: str = ""  # PARTIAL_SUCCESS / NO_DATA / FAILED 时填充
     debug_json_path: str = ""
 
 
@@ -87,6 +94,10 @@ class IChunQiuCollector:
         "Chrome/126.0.0.0 Safari/537.36"
     )
     ORIGIN = "https://match.ichunqiu.com"
+    RETRY_TOTAL = 3
+    RETRY_BACKOFF_FACTOR = 0.6
+    RETRY_STATUS_CODES = (429, 500, 502, 503, 504)
+    REQUEST_TIMEOUT = (10, 30)
 
     BOARD_CONFIGS: Dict[str, Dict[str, str]] = {
         "solved": {"name": "解题总榜", "endpoint": "/match/rank/solved", "sheet": "解题总榜表"},
@@ -152,11 +163,38 @@ class IChunQiuCollector:
             return "队长"
         return str(v)
 
-    def __init__(self, log_callback: Optional[Callable[[str], None]] = None, lang: str = "zh-cn") -> None:
+    def __init__(
+        self,
+        log_callback: Optional[Callable[[str], None]] = None,
+        lang: str = "zh-cn",
+        cancel_check: Optional[Callable[[], bool]] = None,
+    ) -> None:
         self._log_callback = log_callback
         self._lang = lang
+        self._cancel_check = cancel_check
         self._session = requests.Session()
+        retry = Retry(
+            total=self.RETRY_TOTAL,
+            connect=self.RETRY_TOTAL,
+            read=self.RETRY_TOTAL,
+            status=self.RETRY_TOTAL,
+            backoff_factor=self.RETRY_BACKOFF_FACTOR,
+            status_forcelist=self.RETRY_STATUS_CODES,
+            allowed_methods=frozenset({"POST"}),
+            respect_retry_after_header=True,
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        self._session.mount("https://", adapter)
+        self._session.mount("http://", adapter)
         self._request_logs: List[Dict[str, Any]] = []
+
+    def close(self) -> None:
+        self._session.close()
+
+    def _check_cancelled(self) -> None:
+        if self._cancel_check and self._cancel_check():
+            raise OperationCancelled("任务已取消")
 
     def _log(self, message: str) -> None:
         if self._log_callback:
@@ -251,6 +289,7 @@ class IChunQiuCollector:
         return payload
 
     def _post(self, endpoint: str, data: Dict[str, Any], k: str = "", token: str = "") -> Dict[str, Any]:
+        self._check_cancelled()
         payload = self._make_payload(data, k=k, token=token)
         headers = {
             "SIGN": self._calc_sign(payload),
@@ -265,9 +304,15 @@ class IChunQiuCollector:
 
         url = f"{self.BASE_API}{endpoint}"
         started = time.time()
-        response = self._session.post(url, json=payload, headers=headers, timeout=30)
+        response = self._session.post(
+            url,
+            json=payload,
+            headers=headers,
+            timeout=self.REQUEST_TIMEOUT,
+        )
         duration_ms = int((time.time() - started) * 1000)
         response.raise_for_status()
+        self._check_cancelled()
 
         body = response.json()
         body_dict = body if isinstance(body, dict) else {}
@@ -458,6 +503,7 @@ class IChunQiuCollector:
         self._log(f"[{self._now()}] 预计总页数: {total_pages}")
 
         for page in range(2, total_pages + 1):
+            self._check_cancelled()
             page_payload = self._payload_for_board(
                 board_key,
                 page_index=page,
@@ -466,12 +512,21 @@ class IChunQiuCollector:
             )
             resp = self._post(endpoint, page_payload, k=bind.k, token=bind.token)
             if resp.get("code") != 0:
-                self._log(f"[{self._now()}] 警告: 第 {page} 页返回异常 code={resp.get('code')}")
-                continue
+                message = str(resp.get("message", "未知错误"))
+                raise RuntimeError(
+                    f"{self.BOARD_CONFIGS[board_key]['name']}第 {page}/{total_pages} 页"
+                    f"获取失败: code={resp.get('code')} {message}"
+                )
             data = self._as_dict(resp.get("data"))
             page_rows = self._as_list(data.get("lists"))
             rows.extend(x for x in page_rows if isinstance(x, dict))
             self._log(f"[{self._now()}] 已获取第 {page}/{total_pages} 页")
+
+        if total > 0 and len(rows) < total:
+            raise RuntimeError(
+                f"{self.BOARD_CONFIGS[board_key]['name']}数据不完整: "
+                f"接口声明 {total} 条，实际获取 {len(rows)} 条"
+            )
 
         dedup: List[Dict[str, Any]] = []
         seen: set[str] = set()
@@ -495,6 +550,7 @@ class IChunQiuCollector:
         request_count = 0
 
         while True:
+            self._check_cancelled()
             response = self._post(
                 endpoint,
                 {"last_id": "", "number": request_size},
@@ -663,6 +719,7 @@ class IChunQiuCollector:
             return
 
         for row in ws.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col):
+            self._check_cancelled()
             for cell in row:
                 cell.border = border
                 cell.alignment = align
@@ -670,6 +727,7 @@ class IChunQiuCollector:
                     cell.font = header_font
 
         for col in ws.iter_cols(min_row=1, max_row=max_row, min_col=1, max_col=max_col):
+            self._check_cancelled()
             letter = col[0].column_letter
             header = str(col[0].value or "").strip()
             max_len = max(self._cell_display_len(c.value) for c in col)
@@ -679,11 +737,64 @@ class IChunQiuCollector:
                 width = min(max(8, max_len + 2), 90)
             ws.column_dimensions[letter].width = width
 
-    def _fetch_team_roster(self, bind: MatchBindingInfo) -> List[Dict[str, Any]]:
-        """拉取所有团队成员信息。先从积分榜获取全部 team_id，再逐队调用 /match/team/users。"""
-        # 1) 拉所有 team_id（优先使用积分榜数据；若失败回退到解题榜）
+    def _fetch_team_members(
+        self,
+        bind: MatchBindingInfo,
+        team_id: str,
+    ) -> List[Dict[str, Any]]:
+        page_size = 200
+        first_response = self._post(
+            "/match/team/users",
+            {"team_id": team_id, "page_index": 1, "page_size": page_size},
+            k=bind.k,
+            token=bind.token,
+        )
+        if first_response.get("code") != 0:
+            message = str(first_response.get("message", "未知错误"))
+            if first_response.get("code") == 116 or "暂无" in message or "没有" in message:
+                return []
+            raise RuntimeError(
+                f"成员接口调用失败: code={first_response.get('code')} {message}"
+            )
+
+        first_data = self._as_dict(first_response.get("data"))
+        first_rows = self._as_list(first_data.get("lists"))
+        members = [item for item in first_rows if isinstance(item, dict)]
+        total = self._to_int(first_data.get("total"), len(members))
+        total_pages = max(1, math.ceil(total / page_size)) if total > 0 else 1
+
+        for page in range(2, total_pages + 1):
+            self._check_cancelled()
+            response = self._post(
+                "/match/team/users",
+                {"team_id": team_id, "page_index": page, "page_size": page_size},
+                k=bind.k,
+                token=bind.token,
+            )
+            if response.get("code") != 0:
+                message = str(response.get("message", "未知错误"))
+                raise RuntimeError(
+                    f"成员第 {page}/{total_pages} 页获取失败: "
+                    f"code={response.get('code')} {message}"
+                )
+            data = self._as_dict(response.get("data"))
+            rows = self._as_list(data.get("lists"))
+            members.extend(item for item in rows if isinstance(item, dict))
+        if total > 0 and len(members) < total:
+            raise RuntimeError(
+                f"成员数据不完整: 接口声明 {total} 条，实际获取 {len(members)} 条"
+            )
+        return members
+
+    def _fetch_team_roster(
+        self,
+        bind: MatchBindingInfo,
+    ) -> Tuple[List[Dict[str, Any]], List[Tuple[str, str]]]:
+        """拉取团队成员，并单独返回无法完整获取的队伍。"""
         team_rows: List[Dict[str, Any]] = []
+        team_source_errors: List[str] = []
         for source_key in ("integral", "solved"):
+            self._check_cancelled()
             try:
                 _, team_rows, _ = self._collect_rows_for_board(
                     bind=bind, board_key=source_key, page_size=200
@@ -692,43 +803,42 @@ class IChunQiuCollector:
                     break
             except NoDataError:
                 continue
+            except OperationCancelled:
+                raise
             except Exception as exc:  # noqa: BLE001
+                team_source_errors.append(f"{source_key}: {exc}")
                 self._log(f"[{self._now()}] 获取团队列表({source_key})失败: {exc}")
                 continue
 
         if not team_rows:
+            if team_source_errors:
+                raise RuntimeError(
+                    f"团队列表获取失败: {'; '.join(team_source_errors)}"
+                )
             raise NoDataError(self.BOARD_CONFIGS["team_info"]["name"], "未拉取到任何团队")
 
         self._log(f"[{self._now()}] 共 {len(team_rows)} 支队伍，开始逐队拉取成员")
 
-        # 2) 逐队拉成员
         all_members: List[Dict[str, Any]] = []
         failed_teams: List[Tuple[str, str]] = []
         for team in team_rows:
+            self._check_cancelled()
             team_id = str(team.get("team_id") or team.get("source_id") or "").strip()
+            team_name = str(team.get("team_name") or team_id or "未知队伍")
             if not team_id:
+                failed_teams.append((team_name, "缺少 team_id"))
                 continue
-            payload = {"team_id": team_id, "page_index": 1, "page_size": 200}
             try:
-                resp = self._post("/match/team/users", payload, k=bind.k, token=bind.token)
+                members = self._fetch_team_members(bind, team_id)
+            except OperationCancelled:
+                raise
             except Exception as exc:  # noqa: BLE001
-                failed_teams.append((team.get("team_name", team_id), str(exc)))
+                failed_teams.append((team_name, str(exc)))
                 continue
-            if resp.get("code") != 0:
-                msg = resp.get("message", "")
-                if resp.get("code") == 116 or "暂无" in str(msg):
-                    # 该队没有成员数据（单人/空队）—— 跳过即可
-                    self._log(f"[{self._now()}] 队伍 {team.get('team_name', team_id)} 无成员数据")
-                    continue
-                failed_teams.append((team.get("team_name", team_id), f"code={resp.get('code')} {msg}"))
-                continue
-            data_node = self._as_dict(resp.get("data"))
-            members = self._as_list(data_node.get("lists"))
             if not members:
+                self._log(f"[{self._now()}] 队伍 {team_name} 无成员数据")
                 continue
             for m in members:
-                if not isinstance(m, dict):
-                    continue
                 # 注入队伍维度信息：紧跟在 team_id 之后，便于阅读时按"队伍"聚类查看
                 if "team_id" not in m or not m["team_id"]:
                     m["team_id"] = team_id
@@ -753,8 +863,10 @@ class IChunQiuCollector:
             self._log(f"[{self._now()}] 部分队伍成员获取失败: {sample}")
 
         if not all_members:
+            if failed_teams:
+                raise RuntimeError("所有团队成员请求均失败")
             raise NoDataError(self.BOARD_CONFIGS["team_info"]["name"], "所有队伍均无成员数据")
-        return all_members
+        return all_members, failed_teams
 
     def _flatten_member_row(self, item: Dict[str, Any]) -> Dict[str, Any]:
         """成员行扁平化：剔除嵌套结构，把 user_type 转中文。"""
@@ -811,8 +923,9 @@ class IChunQiuCollector:
         final_excel_path = ""
 
         try:
+            self._check_cancelled()
             if board_key == "team_info":
-                members = self._fetch_team_roster(bind)
+                members, failed_teams = self._fetch_team_roster(bind)
                 total_rows = len(members)
                 flattened = [self._flatten_member_row(m) for m in members]
                 df = pd.DataFrame(flattened)
@@ -831,6 +944,11 @@ class IChunQiuCollector:
                     df.to_excel(writer, sheet_name=sheet_name, index=False)
                     self._format_rank_sheet(writer.book[sheet_name])
                     sheets_written += 1
+                    if failed_teams:
+                        status = ExportStatus.PARTIAL_SUCCESS
+                        error_message = "; ".join(
+                            f"{name}: {error}" for name, error in failed_teams
+                        )
             elif board_key != "category":
                 endpoint, rows, total_pages = self._collect_rows_for_board(
                     bind=bind,
@@ -858,6 +976,7 @@ class IChunQiuCollector:
                         f"[{self._now()}] 发现题型分类: {', '.join(str(c['title']) for c in categories)}"
                     )
                     for category in categories:
+                        self._check_cancelled()
                         category_id = str(category["id"])
                         category_title = str(category["title"])
                         try:
@@ -888,7 +1007,8 @@ class IChunQiuCollector:
                         status = ExportStatus.NO_DATA
                         error_message = "所有题型分类下均无数据"
 
-            if status == ExportStatus.SUCCESS and writer is not None:
+            if status in {ExportStatus.SUCCESS, ExportStatus.PARTIAL_SUCCESS} and writer is not None:
+                self._check_cancelled()
                 writer.close()
                 writer = None
                 final_excel_path = str(excel_path)
@@ -898,6 +1018,9 @@ class IChunQiuCollector:
             status = ExportStatus.NO_DATA
             error_message = str(nd)
             self._log(f"[{self._now()}] {board_name}无数据: {error_message}")
+        except OperationCancelled:
+            status = ExportStatus.FAILED
+            raise
         except Exception as exc:  # noqa: BLE001
             status = ExportStatus.FAILED
             error_message = f"{type(exc).__name__}: {exc}"
@@ -908,11 +1031,15 @@ class IChunQiuCollector:
                     writer.close()
                 except Exception:
                     pass
-            # 写出过 Sheet（SUCCESS）但路径未记录 → 补上；NO_DATA / FAILED 不补
-            if status == ExportStatus.SUCCESS and sheets_written > 0 and not final_excel_path:
+            # 写出过 Sheet 但路径未记录时补上；NO_DATA / FAILED 不补。
+            if (
+                status in {ExportStatus.SUCCESS, ExportStatus.PARTIAL_SUCCESS}
+                and sheets_written > 0
+                and not final_excel_path
+            ):
                 final_excel_path = str(excel_path)
             # 失败时可能已有部分工作簿；清理未完成的文件。
-            if status != ExportStatus.SUCCESS and excel_path.exists():
+            if status not in {ExportStatus.SUCCESS, ExportStatus.PARTIAL_SUCCESS} and excel_path.exists():
                 try:
                     excel_path.unlink()
                 except Exception:
@@ -951,6 +1078,9 @@ class IChunQiuCollector:
         if status == ExportStatus.SUCCESS:
             self._log(f"[{self._now()}] 导出完成: {final_excel_path}")
             self._log(f"[{self._now()}] 总条数: {total_rows}")
+        elif status == ExportStatus.PARTIAL_SUCCESS:
+            self._log(f"[{self._now()}] 部分导出完成: {final_excel_path}")
+            self._log(f"[{self._now()}] 已导出条数: {total_rows}; 缺失明细: {error_message}")
         elif status == ExportStatus.NO_DATA:
             self._log(f"[{self._now()}] {board_name}无数据，未生成 Excel 文件")
         else:

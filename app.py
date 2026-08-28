@@ -5,8 +5,8 @@ import traceback
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QThread, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QFont
+from PySide6.QtCore import QThread, QTimer, QUrl, Signal
+from PySide6.QtGui import QCloseEvent, QDesktopServices, QFont
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -24,31 +24,46 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from collector import ExportStatus, IChunQiuCollector, LeaderboardExportResult, MatchBindingInfo
+from collector import (
+    ExportStatus,
+    IChunQiuCollector,
+    LeaderboardExportResult,
+    MatchBindingInfo,
+    OperationCancelled,
+)
 
 
 class BindWorker(QThread):
     log = Signal(str)
     success = Signal(object)
     error = Signal(str)
+    cancelled = Signal()
 
     def __init__(self, url: str, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.url = url
 
     def run(self) -> None:
+        collector = IChunQiuCollector(
+            log_callback=lambda m: self.log.emit(m),
+            cancel_check=self.isInterruptionRequested,
+        )
         try:
-            collector = IChunQiuCollector(log_callback=lambda m: self.log.emit(m))
             result = collector.bind_match(self.url)
             self.success.emit(result)
+        except OperationCancelled:
+            self.cancelled.emit()
         except Exception as exc:  # noqa: BLE001
             self.error.emit(f"{exc}\n\n{traceback.format_exc()}")
+        finally:
+            collector.close()
 
 
 class ExportWorker(QThread):
     log = Signal(str)
     success = Signal(object)
     error = Signal(str)
+    cancelled = Signal()
 
     def __init__(
         self,
@@ -65,39 +80,52 @@ class ExportWorker(QThread):
         self.page_size = page_size
 
     def run(self) -> None:
-        collector = IChunQiuCollector(log_callback=lambda m: self.log.emit(m))
-        results: list[LeaderboardExportResult] = []
-        for board_key in self.board_keys:
-            try:
-                result = collector.export_board_xlsx(
-                    bind=self.bind_info,
-                    output_root=self.output_dir,
-                    board_key=board_key,
-                    page_size=self.page_size,
-                    debug_mode=False,
-                )
-            except Exception as exc:  # noqa: BLE001
-                # 单个榜单的彻底崩溃（极少见，比如连 Excel 都打不开）→ 包成 FAILED 结果继续
-                detail = f"{type(exc).__name__}: {exc}\n\n{traceback.format_exc()}"
-                self.log.emit(f"[Worker] {board_key} 未捕获异常: {detail}")
-                results.append(
-                    LeaderboardExportResult(
+        collector = IChunQiuCollector(
+            log_callback=lambda m: self.log.emit(m),
+            cancel_check=self.isInterruptionRequested,
+        )
+        try:
+            results: list[LeaderboardExportResult] = []
+            for board_key in self.board_keys:
+                if self.isInterruptionRequested():
+                    raise OperationCancelled("任务已取消")
+                try:
+                    result = collector.export_board_xlsx(
+                        bind=self.bind_info,
+                        output_root=self.output_dir,
                         board_key=board_key,
-                        board_name=IChunQiuCollector.BOARD_CONFIGS.get(board_key, {}).get("name", board_key),
-                        status=ExportStatus.FAILED,
-                        excel_path="",
-                        total_rows=0,
-                        total_pages=0,
-                        endpoint=IChunQiuCollector.BOARD_CONFIGS.get(board_key, {}).get("endpoint", ""),
-                        error_message=detail,
+                        page_size=self.page_size,
+                        debug_mode=False,
                     )
+                except OperationCancelled:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    detail = f"{type(exc).__name__}: {exc}\n\n{traceback.format_exc()}"
+                    self.log.emit(f"[Worker] {board_key} 未捕获异常: {detail}")
+                    results.append(
+                        LeaderboardExportResult(
+                            board_key=board_key,
+                            board_name=IChunQiuCollector.BOARD_CONFIGS.get(board_key, {}).get("name", board_key),
+                            status=ExportStatus.FAILED,
+                            excel_path="",
+                            total_rows=0,
+                            total_pages=0,
+                            endpoint=IChunQiuCollector.BOARD_CONFIGS.get(board_key, {}).get("endpoint", ""),
+                            error_message=detail,
+                        )
+                    )
+                    continue
+                results.append(result)
+                self.log.emit(
+                    f"[Worker] {board_key} -> {result.status} ({result.total_rows} 条)"
                 )
-                continue
-            results.append(result)
-            self.log.emit(
-                f"[Worker] {board_key} -> {result.status} ({result.total_rows} 条)"
-            )
-        self.success.emit(results)
+            if self.isInterruptionRequested():
+                raise OperationCancelled("任务已取消")
+            self.success.emit(results)
+        except OperationCancelled:
+            self.cancelled.emit()
+        finally:
+            collector.close()
 
 
 class MainWindow(QMainWindow):
@@ -119,6 +147,7 @@ class MainWindow(QMainWindow):
 
         self.current_bind: Optional[MatchBindingInfo] = None
         self.current_worker: Optional[QThread] = None
+        self._close_pending = False
         self.last_export_dir: str = str((Path.cwd() / "outputs").resolve())
         self.export_btns: dict[str, QPushButton] = {}
 
@@ -138,8 +167,13 @@ class MainWindow(QMainWindow):
         title.setFont(QFont("Microsoft YaHei UI", 18, QFont.Weight.Bold))
         self.status_label = QLabel("状态：就绪")
         self.status_label.setObjectName("statusLabel")
+        self.cancel_btn = QPushButton("取消任务")
+        self.cancel_btn.setObjectName("cancelButton")
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.clicked.connect(self.on_cancel_clicked)
         header.addWidget(title)
         header.addStretch(1)
+        header.addWidget(self.cancel_btn)
         header.addWidget(self.status_label)
         outer.addLayout(header)
 
@@ -339,6 +373,16 @@ class MainWindow(QMainWindow):
                 background: #a8cabc;
                 color: #f2f7f4;
             }
+            QPushButton#cancelButton {
+                background: #c74646;
+            }
+            QPushButton#cancelButton:hover {
+                background: #a93636;
+            }
+            QPushButton#cancelButton:disabled {
+                background: #d8b7b7;
+                color: #f7f2f2;
+            }
             QLabel#statusLabel {
                 background: transparent;
                 color: #27437c;
@@ -352,6 +396,7 @@ class MainWindow(QMainWindow):
 
     def set_busy(self, busy: bool, status: str) -> None:
         self.status_label.setText(f"状态：{status}")
+        self.cancel_btn.setEnabled(busy)
         self.bind_btn.setEnabled(not busy)
         self.collect_all_btn.setEnabled((not busy) and self.current_bind is not None)
         for btn in self.export_btns.values():
@@ -396,6 +441,9 @@ class MainWindow(QMainWindow):
         worker.log.connect(self.append_log)
         worker.success.connect(self.on_bind_success)
         worker.error.connect(self.on_worker_error)
+        worker.cancelled.connect(self.on_worker_cancelled)
+        worker.finished.connect(self.on_worker_finished)
+        worker.finished.connect(worker.deleteLater)
         worker.start()
 
     def on_bind_success(self, bind_obj: object) -> None:
@@ -442,6 +490,9 @@ class MainWindow(QMainWindow):
         worker.log.connect(self.append_log)
         worker.success.connect(self.on_export_success)
         worker.error.connect(self.on_worker_error)
+        worker.cancelled.connect(self.on_worker_cancelled)
+        worker.finished.connect(self.on_worker_finished)
+        worker.finished.connect(worker.deleteLater)
         worker.start()
 
     def on_export_clicked(self, board_key: str) -> None:
@@ -451,6 +502,27 @@ class MainWindow(QMainWindow):
     def on_collect_all_clicked(self) -> None:
         board_keys = [key for key, _ in self.BOARD_BUTTONS]
         self._start_export(board_keys, "一键采集全部榜单")
+
+    def on_cancel_clicked(self) -> None:
+        worker = self.current_worker
+        if worker is None or not worker.isRunning():
+            return
+        self.append_log("正在取消任务，请等待当前请求结束...")
+        self.status_label.setText("状态：正在取消")
+        self.cancel_btn.setEnabled(False)
+        worker.requestInterruption()
+
+    def on_worker_cancelled(self) -> None:
+        self.append_log("任务已取消，未完成的文件已清理。")
+        if not self._close_pending:
+            self.set_busy(False, "已取消")
+
+    def on_worker_finished(self) -> None:
+        worker = self.sender()
+        if worker is self.current_worker:
+            self.current_worker = None
+        if self._close_pending:
+            QTimer.singleShot(0, self.close)
 
     def on_export_success(self, result_obj: object) -> None:
         if not isinstance(result_obj, list) or not all(
@@ -462,6 +534,7 @@ class MainWindow(QMainWindow):
 
         # 分桶
         success_list = [r for r in results if r.status == ExportStatus.SUCCESS]
+        partial_list = [r for r in results if r.status == ExportStatus.PARTIAL_SUCCESS]
         no_data_list = [r for r in results if r.status == ExportStatus.NO_DATA]
         failed_list = [r for r in results if r.status == ExportStatus.FAILED]
 
@@ -474,6 +547,8 @@ class MainWindow(QMainWindow):
             if result.error_message:
                 self.append_log(f"  说明/错误   : {result.error_message}")
 
+        if self._close_pending:
+            return
         self.set_busy(False, "导出完成")
 
         # 单个导出仍走原路径
@@ -481,6 +556,15 @@ class MainWindow(QMainWindow):
             r = results[0]
             if r.status == ExportStatus.SUCCESS:
                 QMessageBox.information(self, "完成", f"{r.board_name}导出成功。\n\n{r.excel_path}")
+            elif r.status == ExportStatus.PARTIAL_SUCCESS:
+                box = QMessageBox(self)
+                box.setIcon(QMessageBox.Warning)
+                box.setWindowTitle("部分完成")
+                box.setText(f"{r.board_name}已导出，但部分数据获取失败。")
+                box.setInformativeText(r.excel_path)
+                box.setDetailedText(r.error_message)
+                box.setStandardButtons(QMessageBox.Ok)
+                box.exec()
             elif r.status == ExportStatus.NO_DATA:
                 QMessageBox.information(
                     self, "完成", f"{r.board_name}暂无数据，未生成 Excel 文件。"
@@ -490,11 +574,13 @@ class MainWindow(QMainWindow):
             return
 
         # 多个榜单：弹汇总
-        self._show_summary(results, success_list, no_data_list, failed_list)
+        self._show_summary(results, success_list, partial_list, no_data_list, failed_list)
 
     def on_worker_error(self, detail: str) -> None:
         self.append_log("任务失败：")
         self.append_log(detail)
+        if self._close_pending:
+            return
         self.set_busy(False, "失败")
         self._show_error_box("任务执行失败", detail)
 
@@ -515,11 +601,13 @@ class MainWindow(QMainWindow):
         self,
         all_results: list[LeaderboardExportResult],
         success_list: list[LeaderboardExportResult],
+        partial_list: list[LeaderboardExportResult],
         no_data_list: list[LeaderboardExportResult],
         failed_list: list[LeaderboardExportResult],
     ) -> None:
         """一键采集后的汇总弹窗。"""
         s_count = len(success_list)
+        p_count = len(partial_list)
         n_count = len(no_data_list)
         f_count = len(failed_list)
         total = len(all_results)
@@ -527,6 +615,7 @@ class MainWindow(QMainWindow):
         # 拼主文本
         lines = [f"共处理 {total} 个榜单："]
         lines.append(f"  ✅ 成功 {s_count} 个")
+        lines.append(f"  ⚠️  部分成功 {p_count} 个")
         lines.append(f"  ⚠️  无数据 {n_count} 个")
         lines.append(f"  ❌ 失败 {f_count} 个")
 
@@ -546,9 +635,25 @@ class MainWindow(QMainWindow):
                 if r.excel_path:
                     lines.append(f"      提示文件: {r.excel_path}")
 
-        # 失败列表拼到详细区
+        if partial_list:
+            lines.append("")
+            lines.append("部分成功的文件：")
+            for r in partial_list:
+                lines.append(f"  • {r.board_name} ({r.total_rows} 行)")
+                if r.excel_path:
+                    lines.append(f"      {r.excel_path}")
+
+        # 部分成功和失败列表拼到详细区
         detail_lines: list[str] = []
+        if partial_list:
+            detail_lines.append("部分成功明细：")
+            for r in partial_list:
+                detail_lines.append("")
+                detail_lines.append(f"--- {r.board_name} ({r.board_key}) ---")
+                detail_lines.append(r.error_message or "部分数据获取失败")
         if failed_list:
+            if detail_lines:
+                detail_lines.append("")
             detail_lines.append("失败明细：")
             for r in failed_list:
                 detail_lines.append("")
@@ -557,7 +662,11 @@ class MainWindow(QMainWindow):
                 detail_lines.append(r.error_message or "未知错误")
 
         box = QMessageBox(self)
-        box.setIcon(QMessageBox.Information if f_count == 0 else QMessageBox.Warning)
+        box.setIcon(
+            QMessageBox.Information
+            if f_count == 0 and p_count == 0
+            else QMessageBox.Warning
+        )
         box.setWindowTitle("一键采集完成")
         box.setText("\n".join(lines))
         if detail_lines:
@@ -573,6 +682,31 @@ class MainWindow(QMainWindow):
             return
         if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve()))):
             QMessageBox.warning(self, "提示", f"无法打开目录: {path}")
+
+    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
+        worker = self.current_worker
+        if worker is None or not worker.isRunning():
+            event.accept()
+            return
+
+        if not self._close_pending:
+            answer = QMessageBox.question(
+                self,
+                "任务正在运行",
+                "当前任务尚未完成。是否取消任务并在清理完成后退出？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                event.ignore()
+                return
+            self._close_pending = True
+            self.append_log("正在取消任务，清理完成后将自动退出...")
+            self.status_label.setText("状态：正在取消并退出")
+            self.cancel_btn.setEnabled(False)
+            worker.requestInterruption()
+
+        event.ignore()
 
 
 def main() -> None:
