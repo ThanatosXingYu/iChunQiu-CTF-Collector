@@ -90,6 +90,11 @@ class IChunQiuCollector:
 
     BOARD_CONFIGS: Dict[str, Dict[str, str]] = {
         "solved": {"name": "解题总榜", "endpoint": "/match/rank/solved", "sheet": "解题总榜表"},
+        "solved_dynamic": {
+            "name": "解题动态",
+            "endpoint": "/match/solved_dynamic",
+            "sheet": "解题动态表",
+        },
         "integral": {"name": "积分总榜", "endpoint": "/match/rank/team", "sheet": "积分总榜表"},
         "question": {"name": "题目榜单", "endpoint": "/match/rank/question", "sheet": "题目榜单表"},
         "single": {"name": "单人总榜", "endpoint": "/match/rank/person", "sheet": "单人总榜表"},
@@ -111,6 +116,7 @@ class IChunQiuCollector:
         "aqzsjd": "理论知识总分",
         "jtsl": "解题数",
         "jcdtm": "解出的题目",
+        "time": "时间",
         "dwcy": "队伍成员",
         "grqx": "个人强项",
         "dwqx": "队伍强项",
@@ -426,6 +432,9 @@ class IChunQiuCollector:
         page_size: int,
         category_id: str = "",
     ) -> Tuple[str, List[Dict[str, Any]], int]:
+        if board_key == "solved_dynamic":
+            return self._collect_solved_dynamic(bind=bind, initial_size=page_size)
+
         endpoint = self.BOARD_CONFIGS[board_key]["endpoint"]
         payload = self._payload_for_board(board_key, page_index=1, page_size=page_size, category_id=category_id)
         first_resp = self._post(endpoint, payload, k=bind.k, token=bind.token)
@@ -475,6 +484,46 @@ class IChunQiuCollector:
             dedup.append(item)
         return endpoint, dedup, total_pages
 
+    def _collect_solved_dynamic(
+        self,
+        bind: MatchBindingInfo,
+        initial_size: int = 200,
+    ) -> Tuple[str, List[Dict[str, Any]], int]:
+        endpoint = self.BOARD_CONFIGS["solved_dynamic"]["endpoint"]
+        request_size = max(200, initial_size)
+        max_request_size = 100_000
+        request_count = 0
+
+        while True:
+            response = self._post(
+                endpoint,
+                {"last_id": "", "number": request_size},
+                k=bind.k,
+                token=bind.token,
+            )
+            request_count += 1
+            if response.get("code") != 0:
+                message = str(response.get("message", "未知错误"))
+                if response.get("code") == 116 or "暂无" in message or "没有" in message:
+                    raise NoDataError(self.BOARD_CONFIGS["solved_dynamic"]["name"], message)
+                raise RuntimeError(
+                    f"解题动态接口调用失败: code={response.get('code')} {message}"
+                )
+
+            data = self._as_dict(response.get("data"))
+            rows = [item for item in self._as_list(data.get("lists")) if isinstance(item, dict)]
+            self._log(
+                f"[{self._now()}] 解题动态请求上限 {request_size}，返回 {len(rows)} 条"
+            )
+            if len(rows) < request_size:
+                break
+            if request_size >= max_request_size:
+                raise RuntimeError("解题动态记录超过 100000 条，已停止继续扩大请求")
+            request_size = min(request_size * 2, max_request_size)
+
+        self._log(f"[{self._now()}] 解题动态共获取 {len(rows)} 条")
+        return endpoint, rows, request_count
+
     def _fetch_category_list(self, bind: MatchBindingInfo) -> List[Dict[str, Any]]:
         resp = self._post("/match/question/category", {}, k=bind.k, token=bind.token)
         if resp.get("code") != 0:
@@ -521,6 +570,10 @@ class IChunQiuCollector:
         if df.empty:
             return df
 
+        if board_key == "solved_dynamic":
+            sort_cols = [column for column in ["time", "id"] if column in df.columns]
+            return df.sort_values(by=sort_cols, na_position="last") if sort_cols else df
+
         if board_key == "single" and "user_rank" in df.columns:
             work = df.copy()
             work["user_rank"] = pd.to_numeric(work["user_rank"], errors="coerce")
@@ -560,6 +613,8 @@ class IChunQiuCollector:
             "total_number": "jtsl",
             "solved_count": "jtsl",
             "solved_titles": "jcdtm",
+            "question_name": "topicName",
+            "time": "time",
             "user_name": "dwcy",
             "province_name": "province",
             "zone_name": "ssfq",
@@ -756,90 +811,93 @@ class IChunQiuCollector:
         final_excel_path = ""
 
         try:
-            writer = pd.ExcelWriter(excel_path, engine="openpyxl")
-            try:
-                if board_key == "team_info":
-                    members = self._fetch_team_roster(bind)
-                    total_rows = len(members)
-                    flattened = [self._flatten_member_row(m) for m in members]
-                    df = pd.DataFrame(flattened)
-                    if not df.empty:
-                        if "team_rank" in df.columns:
-                            df["team_rank"] = pd.to_numeric(df["team_rank"], errors="coerce")
-                        sort_cols = [c for c in ["team_rank", "team_name", "user_name"] if c in df.columns]
-                        if sort_cols:
-                            df = df.sort_values(by=sort_cols, na_position="last")
-                        df = self._translate_dataframe_headers(df, bind=bind, board_key=board_key)
+            if board_key == "team_info":
+                members = self._fetch_team_roster(bind)
+                total_rows = len(members)
+                flattened = [self._flatten_member_row(m) for m in members]
+                df = pd.DataFrame(flattened)
+                if df.empty:
+                    status = ExportStatus.NO_DATA
+                    error_message = "团队信息暂无数据"
+                else:
+                    if "team_rank" in df.columns:
+                        df["team_rank"] = pd.to_numeric(df["team_rank"], errors="coerce")
+                    sort_cols = [c for c in ["team_rank", "team_name", "user_name"] if c in df.columns]
+                    if sort_cols:
+                        df = df.sort_values(by=sort_cols, na_position="last")
+                    df = self._translate_dataframe_headers(df, bind=bind, board_key=board_key)
+                    writer = pd.ExcelWriter(excel_path, engine="openpyxl")
                     sheet_name = self._safe_sheet_name(self.BOARD_CONFIGS[board_key]["sheet"], used_sheet_names)
                     df.to_excel(writer, sheet_name=sheet_name, index=False)
                     self._format_rank_sheet(writer.book[sheet_name])
                     sheets_written += 1
-                elif board_key != "category":
-                    endpoint, rows, total_pages = self._collect_rows_for_board(
-                        bind=bind,
-                        board_key=board_key,
-                        page_size=page_size,
-                    )
-                    total_rows = len(rows)
-                    if total_rows == 0:
-                        status = ExportStatus.NO_DATA
-                        error_message = "该榜单暂无数据"
-                        self._log(f"[{self._now()}] {board_name}无数据，跳过 Excel 生成")
-                    else:
-                        df = self._build_dataframe(rows, bind=bind, board_key=board_key)
-                        sheet_name = self._safe_sheet_name(self.BOARD_CONFIGS[board_key]["sheet"], used_sheet_names)
-                        df.to_excel(writer, sheet_name=sheet_name, index=False)
-                        self._format_rank_sheet(writer.book[sheet_name])
-                        sheets_written += 1
+            elif board_key != "category":
+                endpoint, rows, total_pages = self._collect_rows_for_board(
+                    bind=bind,
+                    board_key=board_key,
+                    page_size=page_size,
+                )
+                total_rows = len(rows)
+                if total_rows == 0:
+                    status = ExportStatus.NO_DATA
+                    error_message = "该榜单暂无数据"
                 else:
-                    categories = self._fetch_category_list(bind)
-                    if not categories:
-                        status = ExportStatus.NO_DATA
-                        error_message = "题型榜单未返回分类"
-                        self._log(f"[{self._now()}] 题型榜单无分类，跳过 Excel 生成")
-                    else:
-                        self._log(
-                            f"[{self._now()}] 发现题型分类: {', '.join(str(c['title']) for c in categories)}"
-                        )
-                        for category in categories:
-                            category_id = str(category["id"])
-                            category_title = str(category["title"])
+                    df = self._build_dataframe(rows, bind=bind, board_key=board_key)
+                    writer = pd.ExcelWriter(excel_path, engine="openpyxl")
+                    sheet_name = self._safe_sheet_name(self.BOARD_CONFIGS[board_key]["sheet"], used_sheet_names)
+                    df.to_excel(writer, sheet_name=sheet_name, index=False)
+                    self._format_rank_sheet(writer.book[sheet_name])
+                    sheets_written += 1
+            else:
+                categories = self._fetch_category_list(bind)
+                if not categories:
+                    status = ExportStatus.NO_DATA
+                    error_message = "题型榜单未返回分类"
+                else:
+                    self._log(
+                        f"[{self._now()}] 发现题型分类: {', '.join(str(c['title']) for c in categories)}"
+                    )
+                    for category in categories:
+                        category_id = str(category["id"])
+                        category_title = str(category["title"])
+                        try:
                             _, rows, pages = self._collect_rows_for_board(
                                 bind=bind,
                                 board_key=board_key,
                                 page_size=page_size,
                                 category_id=category_id,
                             )
-                            total_rows += len(rows)
-                            total_pages += pages
-                            if rows:
-                                df = self._build_dataframe(rows, bind=bind, board_key=board_key)
-                                sheet_name = self._safe_sheet_name(category_title, used_sheet_names)
-                                df.to_excel(writer, sheet_name=sheet_name, index=False)
-                                self._format_rank_sheet(writer.book[sheet_name])
-                                sheets_written += 1
-                                self._log(
-                                    f"[{self._now()}] 题型 {category_title} 导出完成: {len(rows)} 条, {pages} 页"
-                                )
-                        if sheets_written == 0:
-                            status = ExportStatus.NO_DATA
-                            error_message = "所有题型分类下均无数据"
-                            self._log(f"[{self._now()}] 题型榜单各分类均无数据，跳过 Excel 生成")
-                # 走到这里说明没抛异常，writer 已有内容可保存
+                        except NoDataError:
+                            self._log(f"[{self._now()}] 题型 {category_title} 无数据，跳过")
+                            continue
+                        total_rows += len(rows)
+                        total_pages += pages
+                        if not rows:
+                            continue
+                        df = self._build_dataframe(rows, bind=bind, board_key=board_key)
+                        if writer is None:
+                            writer = pd.ExcelWriter(excel_path, engine="openpyxl")
+                        sheet_name = self._safe_sheet_name(category_title, used_sheet_names)
+                        df.to_excel(writer, sheet_name=sheet_name, index=False)
+                        self._format_rank_sheet(writer.book[sheet_name])
+                        sheets_written += 1
+                        self._log(
+                            f"[{self._now()}] 题型 {category_title} 导出完成: {len(rows)} 条, {pages} 页"
+                        )
+                    if sheets_written == 0:
+                        status = ExportStatus.NO_DATA
+                        error_message = "所有题型分类下均无数据"
+
+            if status == ExportStatus.SUCCESS and writer is not None:
                 writer.close()
                 writer = None
                 final_excel_path = str(excel_path)
-            except NoDataError as nd:
-                status = ExportStatus.NO_DATA
-                error_message = str(nd)
-                self._log(f"[{self._now()}] {board_name}无数据: {error_message}")
-                # NO_DATA 不再生成任何 Sheet / 文件
-                try:
-                    if writer is not None:
-                        writer.close()
-                except Exception:
-                    pass
-                writer = None
+            elif status == ExportStatus.NO_DATA:
+                self._log(f"[{self._now()}] {board_name}无数据，跳过 Excel 生成")
+        except NoDataError as nd:
+            status = ExportStatus.NO_DATA
+            error_message = str(nd)
+            self._log(f"[{self._now()}] {board_name}无数据: {error_message}")
         except Exception as exc:  # noqa: BLE001
             status = ExportStatus.FAILED
             error_message = f"{type(exc).__name__}: {exc}"
@@ -853,7 +911,7 @@ class IChunQiuCollector:
             # 写出过 Sheet（SUCCESS）但路径未记录 → 补上；NO_DATA / FAILED 不补
             if status == ExportStatus.SUCCESS and sheets_written > 0 and not final_excel_path:
                 final_excel_path = str(excel_path)
-            # NO_DATA / FAILED：若磁盘上残留了空 xlsx（pd.ExcelWriter 已创建），清理掉
+            # 失败时可能已有部分工作簿；清理未完成的文件。
             if status != ExportStatus.SUCCESS and excel_path.exists():
                 try:
                     excel_path.unlink()

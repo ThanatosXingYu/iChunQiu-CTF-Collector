@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import sys
 import traceback
 from pathlib import Path
@@ -104,6 +103,7 @@ class ExportWorker(QThread):
 class MainWindow(QMainWindow):
     BOARD_BUTTONS = [
         ("solved", "导出解题总榜"),
+        ("solved_dynamic", "导出解题动态"),
         ("integral", "导出积分总榜"),
         ("question", "导出题目榜单"),
         ("single", "导出单人总榜"),
@@ -187,14 +187,14 @@ class MainWindow(QMainWindow):
         self.collect_all_btn.setObjectName("collectAllButton")
         self.collect_all_btn.setEnabled(False)
         self.collect_all_btn.clicked.connect(self.on_collect_all_clicked)
-        board_bar.addWidget(self.collect_all_btn, 0, 0, 1, 3)
+        board_bar.addWidget(self.collect_all_btn, 0, 0, 1, 4)
 
         for idx, (board_key, text) in enumerate(self.BOARD_BUTTONS):
             btn = QPushButton(text)
             btn.setEnabled(False)
             btn.clicked.connect(lambda _=False, key=board_key: self.on_export_clicked(key))
             self.export_btns[board_key] = btn
-            board_bar.addWidget(btn, idx // 3 + 1, idx % 3)
+            board_bar.addWidget(btn, idx // 4 + 1, idx % 4)
 
         layout.addWidget(QLabel("比赛 URL"), 0, 0)
         layout.addWidget(self.url_edit, 0, 1)
@@ -483,7 +483,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, "完成", f"{r.board_name}导出成功。\n\n{r.excel_path}")
             elif r.status == ExportStatus.NO_DATA:
                 QMessageBox.information(
-                    self, "完成", f"{r.board_name}暂无数据，已生成提示文件。\n\n{r.excel_path or '(无)'}"
+                    self, "完成", f"{r.board_name}暂无数据，未生成 Excel 文件。"
                 )
             else:
                 self._show_error_box(f"{r.board_name}导出失败", r.error_message or "未知错误")
@@ -571,7 +571,8 @@ class MainWindow(QMainWindow):
         if not path.exists():
             QMessageBox.warning(self, "提示", f"目录不存在: {path}")
             return
-        os.startfile(str(path))  # type: ignore[attr-defined]
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve()))):
+            QMessageBox.warning(self, "提示", f"无法打开目录: {path}")
 
 
 def main() -> None:
